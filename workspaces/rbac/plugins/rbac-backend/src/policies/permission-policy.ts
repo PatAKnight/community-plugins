@@ -165,6 +165,7 @@ export class RBACPermissionPolicy implements PermissionPolicy {
       enforcerDelegate,
       resolvedConditionValidationLimits,
       conditionalFileLimits,
+      knex,
     );
     await conditionalFile.initialize();
 

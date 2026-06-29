@@ -185,6 +185,7 @@ export class PolicyBuilder {
         conditionStorage,
         env.logger,
         env.auditor,
+        databaseClient,
       );
     }
 

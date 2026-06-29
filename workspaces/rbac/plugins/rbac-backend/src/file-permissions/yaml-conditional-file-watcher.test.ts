@@ -19,6 +19,7 @@ import {
   type MetadataResponse,
 } from '@backstage/plugin-permission-common';
 
+import { Knex } from 'knex';
 import { resolve } from 'path';
 
 import { ActionType, ConditionEvents } from '../auditor/auditor';
@@ -232,6 +233,13 @@ describe('YamlConditionalFileWatcher', () => {
     jest.clearAllMocks();
   });
 
+  const mockKnex = {
+    transaction: jest.fn().mockResolvedValue({
+      commit: jest.fn().mockResolvedValue(undefined),
+      rollback: jest.fn().mockResolvedValue(undefined),
+    }),
+  } as unknown as Knex;
+
   function createWatcher(
     filePath?: string,
   ): YamlConditionalPoliciesFileWatcher {
@@ -246,6 +254,8 @@ describe('YamlConditionalFileWatcher', () => {
       roleMetadataStorageMock,
       roleEventEmitterMock,
       DEFAULT_CONDITION_VALIDATION_LIMITS,
+      {},
+      mockKnex,
     );
   }
 
@@ -269,6 +279,7 @@ describe('YamlConditionalFileWatcher', () => {
         maxBytes,
         maxDocuments,
       },
+      mockKnex,
     );
   }
 
@@ -506,9 +517,11 @@ describe('YamlConditionalFileWatcher', () => {
 
     expect(conditionalStorageMock.createCondition).toHaveBeenCalledWith(
       conditionToStore1,
+      expect.anything(),
     );
     expect(conditionalStorageMock.createCondition).toHaveBeenCalledWith(
       conditionToStore2,
+      expect.anything(),
     );
     expectAuditorLog([
       {
@@ -608,9 +621,11 @@ describe('YamlConditionalFileWatcher', () => {
 
     expect(conditionalStorageMock.createCondition).toHaveBeenCalledWith(
       expectedCondition1,
+      expect.anything(),
     );
     expect(conditionalStorageMock.createCondition).toHaveBeenCalledWith(
       expectedCondition2,
+      expect.anything(),
     );
     expectAuditorLog([
       {
@@ -705,7 +720,10 @@ describe('YamlConditionalFileWatcher', () => {
         success: { ...mappedConditionMeta(conditionToRemove) },
       },
     ]);
-    expect(conditionalStorageMock.deleteCondition).toHaveBeenCalledWith(2);
+    expect(conditionalStorageMock.deleteCondition).toHaveBeenCalledWith(
+      2,
+      expect.anything(),
+    );
   });
 
   test('should handle error on delete condition', async () => {
@@ -736,6 +754,26 @@ describe('YamlConditionalFileWatcher', () => {
         fail: {
           error: new NotFoundError('Condition was not found'),
           ...mappedConditionMeta(conditionToRemove),
+        },
+      },
+      {
+        event: {
+          eventId: ConditionEvents.CONDITIONAL_POLICIES_FILE_CHANGE,
+          meta: {
+            source: 'conditional-policies-file',
+            pendingAdds: 0,
+            pendingRemoves: 1,
+            pluginIds: [],
+          },
+        },
+        fail: {
+          error: new NotFoundError('Condition was not found'),
+          meta: {
+            source: 'conditional-policies-file',
+            pendingAdds: 0,
+            pendingRemoves: 1,
+            pluginIds: [],
+          },
         },
       },
     ]);
@@ -818,6 +856,7 @@ describe('YamlConditionalFileWatcher', () => {
     expect(conditionalStorageMock.deleteCondition).toHaveBeenNthCalledWith(
       1,
       2,
+      undefined,
     );
   });
 

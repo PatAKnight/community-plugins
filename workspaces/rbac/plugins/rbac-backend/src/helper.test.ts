@@ -981,6 +981,63 @@ describe('planConditionalReconcile', () => {
     expect(plan.creates).toHaveLength(1);
     expect(plan.deletes).toHaveLength(1);
   });
+
+  it('merging two sibling conditions into one routes update + delete, but update expands into the sibling action set', () => {
+    const storedRead = {
+      id: 1,
+      result: AuthorizeResult.CONDITIONAL,
+      roleEntityRef: 'role:default/test',
+      pluginId: 'catalog',
+      resourceType: 'catalog-entity',
+      permissionMapping: [
+        { name: 'catalog.entity.read', action: 'read' as const },
+      ],
+      conditions: {
+        rule: 'IS_ENTITY_OWNER',
+        resourceType: 'catalog-entity',
+        params: { claims: ['group:default/team-a'] },
+      },
+    };
+    const storedDelete = {
+      id: 2,
+      result: AuthorizeResult.CONDITIONAL,
+      roleEntityRef: 'role:default/test',
+      pluginId: 'catalog',
+      resourceType: 'catalog-entity',
+      permissionMapping: [
+        { name: 'catalog.entity.delete', action: 'delete' as const },
+      ],
+      conditions: {
+        rule: 'IS_ENTITY_OWNER',
+        resourceType: 'catalog-entity',
+        params: { claims: ['group:default/team-a'] },
+      },
+    };
+
+    const merged = {
+      ...storedRead,
+      permissionMapping: [
+        { name: 'catalog.entity.read', action: 'read' as const },
+        { name: 'catalog.entity.delete', action: 'delete' as const },
+      ],
+    };
+
+    const plan = planConditionalReconcile(
+      [merged],
+      [storedRead, storedDelete],
+      item => permissionMappingToActions(item.permissionMapping),
+    );
+
+    // planConditionalReconcile pairs merged with storedRead (overlap on 'read')
+    // and leaves storedDelete as a pending delete.
+    // Callers must execute plan.deletes before plan.updates so that
+    // checkConflictedConditions does not find the sibling.
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].stored.id).toBe(storedRead.id);
+    expect(plan.deletes).toHaveLength(1);
+    expect(plan.deletes[0].id).toBe(storedDelete.id);
+    expect(plan.creates).toHaveLength(0);
+  });
 });
 
 describe('conditionalActionsOverlap', () => {

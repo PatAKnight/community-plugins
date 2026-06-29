@@ -30,6 +30,7 @@ import type {
 } from '@backstage-community/plugin-rbac-common';
 
 import fs from 'fs';
+import { Knex } from 'knex';
 
 import { ActionType, ConditionEvents } from '../auditor/auditor';
 import { ConditionalStorage } from '../database/conditional-storage';
@@ -125,6 +126,7 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
     private readonly roleEventEmitter: RoleEventEmitter<RoleEvents>,
     conditionValidationLimits: ConditionValidationLimits,
     limits: Partial<ConditionalPoliciesFileLimits> = {},
+    private readonly knex: Knex,
   ) {
     super(filePath, allowReload, logger);
 
@@ -284,6 +286,7 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
 
     // Map all additions, then apply updates/creates before deletes so a failed
     // persist does not delete stored conditions (#9429).
+    const trx = await this.knex.transaction();
     try {
       const stagedAdditions: RoleConditionalPolicyDecision<PermissionInfo>[] =
         [];
@@ -303,23 +306,29 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
         item => permissionMappingToActions(item.permissionMapping),
       );
 
+      // Delete first so checkConflictedConditions inside updateCondition
+      // does not find siblings that are about to be removed.
+      // Safe because the transaction rolls back everything on failure.
+      for (const condition of plan.deletes) {
+        await this.persistConditionRemoval(condition, trx);
+      }
+
       for (const { stored, desired } of plan.updates) {
-        await this.persistConditionUpdate(stored.id!, desired);
+        await this.persistConditionUpdate(stored.id!, desired, trx);
       }
 
       for (const conditionToCreate of plan.creates) {
-        await this.persistConditionAddition(conditionToCreate);
+        await this.persistConditionAddition(conditionToCreate, trx);
       }
 
-      for (const condition of plan.deletes) {
-        await this.persistConditionRemoval(condition);
-      }
+      await trx.commit();
 
       this.conditionsDiff = {
         addedConditions: [],
         removedConditions: [],
       };
     } catch (error) {
+      await trx.rollback();
       await abortConditionalPolicyReconcile({
         logger: this.logger,
         auditor: this.auditor,
@@ -336,6 +345,7 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
   private async persistConditionUpdate(
     id: number,
     conditionToUpdate: RoleConditionalPolicyDecision<PermissionInfo>,
+    trx?: Knex.Transaction,
   ): Promise<void> {
     const auditorEvent = await this.auditor.createEvent({
       eventId: ConditionEvents.CONDITION_WRITE,
@@ -344,7 +354,7 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
     });
 
     try {
-      await this.conditionalStorage.updateCondition(id, conditionToUpdate);
+      await this.conditionalStorage.updateCondition(id, conditionToUpdate, trx);
       await auditorEvent.success({
         meta: {
           condition: {
@@ -373,6 +383,7 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
 
   private async persistConditionAddition(
     conditionToCreate: RoleConditionalPolicyDecision<PermissionInfo>,
+    trx?: Knex.Transaction,
   ): Promise<void> {
     const auditorEvent = await this.auditor.createEvent({
       eventId: ConditionEvents.CONDITION_WRITE,
@@ -381,7 +392,7 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
     });
 
     try {
-      await this.conditionalStorage.createCondition(conditionToCreate);
+      await this.conditionalStorage.createCondition(conditionToCreate, trx);
       await auditorEvent.success({
         meta: {
           condition: {
@@ -410,6 +421,7 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
 
   private async persistConditionRemoval(
     condition: RoleConditionalPolicyDecision<PermissionAction>,
+    trx?: Knex.Transaction,
   ): Promise<void> {
     const auditorEvent = await this.auditor.createEvent({
       eventId: ConditionEvents.CONDITION_WRITE,
@@ -424,15 +436,18 @@ export class YamlConditionalPoliciesFileWatcher extends AbstractFileWatcher<
           condition.pluginId,
           condition.resourceType,
           condition.permissionMapping,
+          undefined,
+          trx,
         )
       )[0];
-      await this.conditionalStorage.deleteCondition(conditionToDelete.id!);
+      await this.conditionalStorage.deleteCondition(conditionToDelete.id!, trx);
       await auditorEvent.success({ meta: { condition } });
     } catch (error) {
       await auditorEvent.fail({
         error,
         meta: { condition },
       });
+      throw error;
     }
   }
 

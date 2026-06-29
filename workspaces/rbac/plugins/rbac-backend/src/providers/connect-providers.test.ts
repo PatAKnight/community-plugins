@@ -253,6 +253,13 @@ describe('Connection', () => {
       await conditionalStorageMock.createCondition(conditionalPermission);
     }
 
+    const mockKnex = {
+      transaction: jest.fn().mockResolvedValue({
+        commit: jest.fn().mockResolvedValue(undefined),
+        rollback: jest.fn().mockResolvedValue(undefined),
+      }),
+    } as unknown as Knex.Knex;
+
     provider = new Connection(
       id,
       enforcerDelegate,
@@ -260,6 +267,7 @@ describe('Connection', () => {
       conditionalStorageMock,
       mockLoggerService,
       mockAuditorService,
+      mockKnex,
     );
 
     clearAuditorMock();
@@ -600,10 +608,15 @@ describe('Connection', () => {
       (conditionalStorageMock.createCondition as jest.Mock).mockReset();
       (conditionalStorageMock.deleteCondition as jest.Mock).mockReset();
       (conditionalStorageMock.updateCondition as jest.Mock).mockReset();
+      (conditionalStorageMock.filterConditions as jest.Mock).mockImplementation(
+        () => existingConditionalPermission,
+      );
+      clearAuditorMock();
     });
 
     afterEach(() => {
       (mockLoggerService.warn as jest.Mock).mockReset();
+      (mockLoggerService.error as jest.Mock).mockReset();
       (conditionalStorageMock.createCondition as jest.Mock).mockReset();
       (conditionalStorageMock.deleteCondition as jest.Mock).mockReset();
       (conditionalStorageMock.updateCondition as jest.Mock).mockReset();
@@ -630,6 +643,7 @@ describe('Connection', () => {
       await provider.applyConditionalPermissions(policies);
       expect(conditionalStorageMock.createCondition).toHaveBeenCalledWith(
         ...policies,
+        expect.anything(),
       );
     });
 
@@ -655,6 +669,7 @@ describe('Connection', () => {
       await provider.applyConditionalPermissions(policies);
       expect(conditionalStorageMock.deleteCondition).toHaveBeenCalledWith(
         ...existingConditionalPermission.map(it => it.id),
+        expect.anything(),
       );
     });
 
@@ -712,6 +727,7 @@ describe('Connection', () => {
       expect(conditionalStorageMock.updateCondition).toHaveBeenCalledWith(
         existingConditionalPermission[0].id,
         policies[0],
+        expect.anything(),
       );
       expect(conditionalStorageMock.deleteCondition).not.toHaveBeenCalled();
       expect(conditionalStorageMock.createCondition).not.toHaveBeenCalled();
@@ -743,6 +759,7 @@ describe('Connection', () => {
       expect(conditionalStorageMock.updateCondition).toHaveBeenCalledWith(
         existingConditionalPermission[0].id,
         policies[0],
+        expect.anything(),
       );
       expect(conditionalStorageMock.deleteCondition).not.toHaveBeenCalled();
       expect(conditionalStorageMock.createCondition).not.toHaveBeenCalled();
@@ -795,7 +812,254 @@ describe('Connection', () => {
       expect(conditionalStorageMock.createCondition).not.toHaveBeenCalled();
     });
 
+    it('should merge two sibling conditions into one by deleting sibling before update (#review-bug-1)', async () => {
+      const storedRead: RoleConditionalPolicyDecision<PermissionInfo> = {
+        id: 1,
+        result: 'CONDITIONAL',
+        roleEntityRef: 'role:default/existing-provider-role',
+        pluginId: 'catalog',
+        resourceType: 'catalog-entity',
+        permissionMapping: [{ name: 'read', action: 'read' }],
+        conditions: {
+          rule: 'IS_ENTITY_OWNER',
+          resourceType: 'catalog-entity',
+          params: { claims: ['group:default/team-a'] },
+        },
+      };
+      const storedDelete: RoleConditionalPolicyDecision<PermissionInfo> = {
+        id: 2,
+        result: 'CONDITIONAL',
+        roleEntityRef: 'role:default/existing-provider-role',
+        pluginId: 'catalog',
+        resourceType: 'catalog-entity',
+        permissionMapping: [{ name: 'delete', action: 'delete' }],
+        conditions: {
+          rule: 'IS_ENTITY_OWNER',
+          resourceType: 'catalog-entity',
+          params: { claims: ['group:default/team-a'] },
+        },
+      };
+
+      (conditionalStorageMock.filterConditions as jest.Mock).mockResolvedValue([
+        storedRead,
+        storedDelete,
+      ]);
+
+      const merged: RoleConditionalPolicyDecision<PermissionInfo>[] = [
+        {
+          id: storedRead.id,
+          result: 'CONDITIONAL',
+          roleEntityRef: 'role:default/existing-provider-role',
+          pluginId: 'catalog',
+          resourceType: 'catalog-entity',
+          permissionMapping: [
+            { name: 'read', action: 'read' },
+            { name: 'delete', action: 'delete' },
+          ],
+          conditions: storedRead.conditions,
+        },
+      ];
+
+      const callOrder: string[] = [];
+      (conditionalStorageMock.deleteCondition as jest.Mock).mockImplementation(
+        () => {
+          callOrder.push('delete');
+        },
+      );
+      (conditionalStorageMock.updateCondition as jest.Mock).mockImplementation(
+        () => {
+          callOrder.push('update');
+        },
+      );
+
+      await provider.applyConditionalPermissions(merged);
+
+      // Sibling (storedDelete) is deleted BEFORE update so
+      // checkConflictedConditions won't find a conflicting row.
+      expect(conditionalStorageMock.deleteCondition).toHaveBeenCalledTimes(1);
+      expect(conditionalStorageMock.deleteCondition).toHaveBeenCalledWith(
+        storedDelete.id,
+        expect.anything(),
+      );
+      expect(conditionalStorageMock.updateCondition).toHaveBeenCalledTimes(1);
+      expect(conditionalStorageMock.updateCondition).toHaveBeenCalledWith(
+        storedRead.id,
+        merged[0],
+        expect.anything(),
+      );
+      expect(conditionalStorageMock.createCondition).not.toHaveBeenCalled();
+
+      // Verify ordering: delete before update
+      expect(callOrder).toEqual(['delete', 'update']);
+    });
+
+    it('should partially commit updates when a later persist fails — no transaction rollback (#review-bug-2)', async () => {
+      const storedA: RoleConditionalPolicyDecision<PermissionInfo> = {
+        id: 1,
+        result: 'CONDITIONAL',
+        roleEntityRef: 'role:default/existing-provider-role',
+        pluginId: 'catalog',
+        resourceType: 'catalog-entity',
+        permissionMapping: [{ name: 'read', action: 'read' }],
+        conditions: {
+          rule: 'IS_ENTITY_OWNER',
+          resourceType: 'catalog-entity',
+          params: { claims: ['group:default/team-a'] },
+        },
+      };
+      const storedB: RoleConditionalPolicyDecision<PermissionInfo> = {
+        id: 2,
+        result: 'CONDITIONAL',
+        roleEntityRef: 'role:default/existing-provider-role',
+        pluginId: 'scaffolder',
+        resourceType: 'scaffolder-template',
+        permissionMapping: [{ name: 'read', action: 'read' }],
+        conditions: {
+          rule: 'IS_ENTITY_OWNER',
+          resourceType: 'scaffolder-template',
+          params: { claims: ['group:default/team-a'] },
+        },
+      };
+
+      (conditionalStorageMock.filterConditions as jest.Mock).mockResolvedValue([
+        storedA,
+        storedB,
+      ]);
+
+      let updateCallCount = 0;
+      (conditionalStorageMock.updateCondition as jest.Mock).mockImplementation(
+        () => {
+          updateCallCount++;
+          if (updateCallCount === 2) {
+            throw new Error('DB constraint violation on second update');
+          }
+        },
+      );
+
+      // Both conditions changed — both will be routed to plan.updates
+      const desiredA: RoleConditionalPolicyDecision<PermissionInfo> = {
+        ...storedA,
+        permissionMapping: [
+          { name: 'read', action: 'read' },
+          { name: 'update', action: 'update' },
+        ],
+      };
+      const desiredB: RoleConditionalPolicyDecision<PermissionInfo> = {
+        ...storedB,
+        permissionMapping: [
+          { name: 'read', action: 'read' },
+          { name: 'create', action: 'create' },
+        ],
+      };
+
+      await provider.applyConditionalPermissions([desiredA, desiredB]);
+
+      // BUG: First update committed successfully (auto-commit, no transaction).
+      // Second update threw. Abort handler fires claiming full rollback,
+      // but storedA is already mutated in the DB.
+      expect(conditionalStorageMock.updateCondition).toHaveBeenCalledTimes(2);
+      expect(conditionalStorageMock.updateCondition).toHaveBeenNthCalledWith(
+        1,
+        storedA.id,
+        desiredA,
+        expect.anything(),
+      );
+
+      // Deletes never executed because abort fired
+      expect(conditionalStorageMock.deleteCondition).not.toHaveBeenCalled();
+      expect(conditionalStorageMock.createCondition).not.toHaveBeenCalled();
+
+      // Abort event claims full abort — misleading since update 1 already committed
+      expect(mockLoggerService.error).toHaveBeenCalledWith(
+        expect.stringContaining('Conditional policy reconcile aborted'),
+        expect.objectContaining({
+          event: 'conditional_reconcile_aborted',
+        }),
+      );
+    });
+
+    it('should partially commit when create fails after successful updates (#review-bug-2)', async () => {
+      const storedOld: RoleConditionalPolicyDecision<PermissionInfo> = {
+        id: 1,
+        result: 'CONDITIONAL',
+        roleEntityRef: 'role:default/existing-provider-role',
+        pluginId: 'catalog',
+        resourceType: 'catalog-entity',
+        permissionMapping: [{ name: 'read', action: 'read' }],
+        conditions: {
+          rule: 'IS_ENTITY_OWNER',
+          resourceType: 'catalog-entity',
+          params: { claims: ['group:default/team-a'] },
+        },
+      };
+
+      (conditionalStorageMock.filterConditions as jest.Mock).mockResolvedValue([
+        storedOld,
+      ]);
+
+      (conditionalStorageMock.updateCondition as jest.Mock).mockImplementation(
+        () => {},
+      );
+      (conditionalStorageMock.createCondition as jest.Mock).mockImplementation(
+        () => {
+          throw new Error('unique constraint violation');
+        },
+      );
+
+      // Changed storedOld (→ update) + brand new condition (→ create)
+      const desiredChanged: RoleConditionalPolicyDecision<PermissionInfo> = {
+        ...storedOld,
+        conditions: {
+          rule: 'IS_ENTITY_OWNER',
+          resourceType: 'catalog-entity',
+          params: { claims: ['group:default/team-b'] },
+        },
+      };
+      const desiredNew: RoleConditionalPolicyDecision<PermissionInfo> = {
+        id: 0,
+        result: 'CONDITIONAL',
+        roleEntityRef: 'role:default/existing-provider-role',
+        pluginId: 'scaffolder',
+        resourceType: 'scaffolder-template',
+        permissionMapping: [{ name: 'read', action: 'read' }],
+        conditions: {
+          rule: 'IS_ENTITY_OWNER',
+          resourceType: 'scaffolder-template',
+          params: { claims: ['group:default/team-b'] },
+        },
+      };
+
+      await provider.applyConditionalPermissions([desiredChanged, desiredNew]);
+
+      // Update succeeded and auto-committed
+      expect(conditionalStorageMock.updateCondition).toHaveBeenCalledTimes(1);
+      expect(conditionalStorageMock.updateCondition).toHaveBeenCalledWith(
+        storedOld.id,
+        desiredChanged,
+        expect.anything(),
+      );
+
+      // Create failed — abort fired, no deletes
+      expect(conditionalStorageMock.createCondition).toHaveBeenCalledTimes(1);
+      expect(conditionalStorageMock.deleteCondition).not.toHaveBeenCalled();
+
+      // Abort says full failure, but the update already committed
+      expect(mockLoggerService.error).toHaveBeenCalledWith(
+        expect.stringContaining('Conditional policy reconcile aborted'),
+        expect.objectContaining({
+          event: 'conditional_reconcile_aborted',
+        }),
+      );
+    });
+
     it('should reject policies from an invalid source', async () => {
+      const anotherMockKnex = {
+        transaction: jest.fn().mockResolvedValue({
+          commit: jest.fn().mockResolvedValue(undefined),
+          rollback: jest.fn().mockResolvedValue(undefined),
+        }),
+      } as unknown as Knex.Knex;
+
       const anotherProvider = new Connection(
         'another-provider',
         enforcerDelegate,
@@ -803,6 +1067,7 @@ describe('Connection', () => {
         conditionalStorageMock,
         mockLoggerService,
         mockAuditorService,
+        anotherMockKnex,
       );
 
       const policies: RoleConditionalPolicyDecision<PermissionInfo>[] = [
@@ -889,6 +1154,7 @@ describe('connectRBACProviders', () => {
       conditionalStorageMock,
       mockLoggerService,
       mockAuditorService,
+      knex,
     );
 
     expect(connectSpy).toHaveBeenCalled();

@@ -47,6 +47,7 @@ export interface ConditionalStorage {
   ): Promise<RoleConditionalPolicyDecision<PermissionInfo>[]>;
   createCondition(
     conditionalDecision: RoleConditionalPolicyDecision<PermissionInfo>,
+    trx?: Knex.Transaction | Knex,
   ): Promise<number>;
   checkConflictedConditions(
     roleEntityRef: string,
@@ -59,7 +60,7 @@ export interface ConditionalStorage {
     id: number,
     trx?: Knex.Transaction | Knex,
   ): Promise<RoleConditionalPolicyDecision<PermissionInfo> | undefined>;
-  deleteCondition(id: number): Promise<void>;
+  deleteCondition(id: number, trx?: Knex.Transaction | Knex): Promise<void>;
   updateCondition(
     id: number,
     conditionalDecision: RoleConditionalPolicyDecision<PermissionInfo>,
@@ -125,16 +126,20 @@ export class DataBaseConditionalStorage implements ConditionalStorage {
 
   async createCondition(
     conditionalDecision: RoleConditionalPolicyDecision<PermissionInfo>,
+    trx?: Knex.Transaction | Knex,
   ): Promise<number> {
+    const db = trx ?? this.knex;
     await this.checkConflictedConditions(
       conditionalDecision.roleEntityRef,
       conditionalDecision.resourceType,
       conditionalDecision.pluginId,
       conditionalDecision.permissionMapping.map(permInfo => permInfo.action),
+      undefined,
+      db,
     );
 
     const conditionRaw = this.toDAO(conditionalDecision);
-    const result = await this.knex
+    const result = await db
       .table(CONDITIONAL_TABLE)
       .insert<ConditionalPolicyDecisionDAO>(conditionRaw)
       .returning('id');
@@ -205,12 +210,16 @@ export class DataBaseConditionalStorage implements ConditionalStorage {
     return undefined;
   }
 
-  async deleteCondition(id: number): Promise<void> {
-    const condition = await this.getCondition(id);
+  async deleteCondition(
+    id: number,
+    trx?: Knex.Transaction | Knex,
+  ): Promise<void> {
+    const db = trx ?? this.knex;
+    const condition = await this.getCondition(id, db);
     if (!condition) {
       throw new NotFoundError(`Condition with id ${id} was not found`);
     }
-    await this.knex?.table(CONDITIONAL_TABLE).delete().whereIn('id', [id]);
+    await db.table(CONDITIONAL_TABLE).delete().whereIn('id', [id]);
   }
 
   async updateCondition(

@@ -60,6 +60,7 @@ import {
   RoleConditionalPolicyDecision,
 } from '@backstage-community/plugin-rbac-common';
 import { isEqual } from 'lodash';
+import { Knex } from 'knex';
 
 export class Connection implements RBACProviderConnection {
   constructor(
@@ -69,6 +70,7 @@ export class Connection implements RBACProviderConnection {
     private readonly conditionStorage: ConditionalStorage,
     private readonly logger: LoggerService,
     private readonly auditor: AuditorService,
+    private readonly knex: Knex,
   ) {}
 
   async applyRoles(roles: string[][]): Promise<void> {
@@ -128,8 +130,9 @@ export class Connection implements RBACProviderConnection {
   async applyConditionalPermissions(
     conditionalPermissions: RoleConditionalPolicyDecision<PermissionInfo>[],
   ): Promise<void> {
+    const providerRoles = await this.getProviderRoles();
     const storedConditionalPermissions =
-      await this.conditionStorage.filterConditions();
+      await this.conditionStorage.filterConditions(providerRoles);
 
     const diff = diffConditionalPolicies(
       storedConditionalPermissions,
@@ -146,8 +149,7 @@ export class Connection implements RBACProviderConnection {
       return;
     }
 
-    // Stage all additions, then apply updates/creates before deletes so a failed
-    // persist does not delete stored conditions (#9429).
+    const trx = await this.knex.transaction();
     try {
       for (const condition of diff.toAdd) {
         const metadata = await this.roleMetadataStorage.findRoleMetadata(
@@ -163,18 +165,24 @@ export class Connection implements RBACProviderConnection {
         permissionMappingToActions(item.permissionMapping),
       );
 
+      // Delete first so checkConflictedConditions inside updateCondition
+      // does not find siblings that are about to be removed.
+      // Safe because the transaction rolls back everything on failure.
+      for (const condition of plan.deletes) {
+        await this.persistConditionalRemoval(condition, trx);
+      }
+
       for (const { stored, desired } of plan.updates) {
-        await this.persistConditionalUpdate(stored.id!, desired);
+        await this.persistConditionalUpdate(stored.id!, desired, trx);
       }
 
       for (const condition of plan.creates) {
-        await this.persistConditionalAddition(condition);
+        await this.persistConditionalAddition(condition, trx);
       }
 
-      for (const condition of plan.deletes) {
-        await this.persistConditionalRemoval(condition);
-      }
+      await trx.commit();
     } catch (error) {
+      await trx.rollback();
       await abortConditionalPolicyReconcile({
         logger: this.logger,
         auditor: this.auditor,
@@ -365,6 +373,7 @@ export class Connection implements RBACProviderConnection {
   private async persistConditionalUpdate(
     id: number,
     condition: RoleConditionalPolicyDecision<PermissionInfo>,
+    trx?: Knex.Transaction,
   ): Promise<void> {
     const auditorMeta = {
       policies: [condition],
@@ -378,7 +387,7 @@ export class Connection implements RBACProviderConnection {
       },
     });
     try {
-      await this.conditionStorage.updateCondition(id, condition);
+      await this.conditionStorage.updateCondition(id, condition, trx);
       await auditorEvent.success({ meta: auditorMeta });
     } catch (error) {
       await auditorEvent.fail({ error, meta: auditorMeta });
@@ -388,6 +397,7 @@ export class Connection implements RBACProviderConnection {
 
   private async persistConditionalAddition(
     condition: RoleConditionalPolicyDecision<PermissionInfo>,
+    trx?: Knex.Transaction,
   ): Promise<void> {
     const auditorMeta = {
       policies: [condition],
@@ -401,7 +411,7 @@ export class Connection implements RBACProviderConnection {
       },
     });
     try {
-      await this.conditionStorage.createCondition(condition);
+      await this.conditionStorage.createCondition(condition, trx);
       await auditorEvent.success({ meta: auditorMeta });
     } catch (error) {
       await auditorEvent.fail({ error, meta: auditorMeta });
@@ -411,6 +421,7 @@ export class Connection implements RBACProviderConnection {
 
   private async persistConditionalRemoval(
     conditionalPermission: RoleConditionalPolicyDecision<PermissionInfo>,
+    trx?: Knex.Transaction,
   ): Promise<void> {
     const auditorMeta = {
       policies: [conditionalPermission],
@@ -428,13 +439,17 @@ export class Connection implements RBACProviderConnection {
       if (err) {
         throw err;
       }
-      await this.conditionStorage.deleteCondition(conditionalPermission.id!);
+      await this.conditionStorage.deleteCondition(
+        conditionalPermission.id!,
+        trx,
+      );
       await auditorEvent.success({ meta: auditorMeta });
     } catch (error) {
       await auditorEvent.fail({
         error,
         meta: auditorMeta,
       });
+      throw error;
     }
   }
 
@@ -453,6 +468,7 @@ export async function connectRBACProviders(
   conditionStorage: ConditionalStorage,
   logger: LoggerService,
   auditor: AuditorService,
+  knex: Knex,
 ) {
   await Promise.all(
     providers.map(async provider => {
@@ -464,6 +480,7 @@ export async function connectRBACProviders(
           conditionStorage,
           logger,
           auditor,
+          knex,
         );
         return provider.connect(connection);
       } catch (error) {
